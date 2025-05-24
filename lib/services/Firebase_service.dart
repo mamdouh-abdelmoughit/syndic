@@ -1,13 +1,15 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart'; // For debugPrint and kDebugMode
+import 'package:intl/intl.dart'; // Import intl for DateFormat
 
-// Keep your Payment class (or adapt if needed)
+// Payment class (remains the same as your provided version)
 class Payment {
-  final String id; // Use String for Firestore IDs
+  final String id;
   final String residentId;
   final double amount;
-  final String monthsCovered;
-  final DateTime paymentDate;
+  final String
+      monthsCovered; // e.g., "Janvier 2024" or "Janvier 2024, Février 2024" (original string)
+  final DateTime paymentDate; // Actual date of payment transaction from dialog
   final String residentName;
 
   Payment({
@@ -27,213 +29,379 @@ class Payment {
       residentId: data['resident_id'] ?? '',
       amount: (data['amount'] ?? 0.0).toDouble(),
       monthsCovered: data['months_covered'] ?? '',
-      // Convert Firestore Timestamp to DateTime
-      paymentDate: (data['payment_date'] as Timestamp?)?.toDate() ?? DateTime.now(),
-      residentName: data['resident_name'] ?? 'Unknown', // Handle missing denormalized data
+      // Convert Firestore Timestamp to DateTime for payment_date field
+      paymentDate:
+          (data['payment_date'] as Timestamp?)?.toDate() ?? DateTime.now(),
+      residentName: data['resident_name'] ?? 'Unknown',
     );
   }
 
-  // Method to convert Payment object to Map for Firestore
+  // Method to convert Payment object to Map for Firestore (used when *sending* data)
   Map<String, dynamic> toFirestore() {
     return {
       'resident_id': residentId,
       'amount': amount,
       'months_covered': monthsCovered,
-      'payment_date': Timestamp.fromDate(paymentDate), // Convert DateTime to Timestamp
+      'payment_date':
+          Timestamp.fromDate(paymentDate), // Convert DateTime to Timestamp
       'resident_name': residentName,
+      // Note: 'months_covered_str' is added internally in addPaymentNew for efficiency
     };
   }
 }
 
-
 class FirebaseService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
+
+  // Define the Caisse document reference
+  // Use a specific ID like 'current_balance' for the single caisse document
+  final DocumentReference<Map<String, dynamic>> _caisseDocRef =
+      FirebaseFirestore.instance
+          .collection('caisse_status')
+          .doc('current_balance');
+
+  // Helper to parse 'months_covered' string (assuming comma-separated "MMMM yyyy")
+  // Normalizes to lowercase for consistent matching.
+  Set<String> _parseMonthsCovered(String? monthsCoveredStr) {
+    if (monthsCoveredStr == null || monthsCoveredStr.isEmpty) {
+      return {};
+    }
+    return monthsCoveredStr
+        .toLowerCase()
+        .split(',')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toSet();
+  }
+
+  // --- Caisse Methods ---
+
+  // Get a stream of the caisse balance document for real-time updates
+  Stream<DocumentSnapshot<Map<String, dynamic>>> getCaisseBalanceStream() {
+    return _caisseDocRef.snapshots();
+  }
+
+  // Initialize or set the caisse balance
+  Future<void> initializeCaisse(double initialBalance) async {
+    // Use a transaction to safely check and set the initial balance
+    await _db.runTransaction((transaction) async {
+      final snapshot = await transaction.get(_caisseDocRef);
+
+      if (snapshot.exists) {
+        // Caisse document already exists, update the balance
+        debugPrint("Caisse document already exists. Updating balance.");
+        transaction.update(_caisseDocRef, {
+          'balance': initialBalance,
+          'last_updated': FieldValue
+              .serverTimestamp(), // Use server timestamp for update time
+        });
+      } else {
+        // Caisse document does not exist, create it
+        debugPrint(
+            "Caisse document does not exist. Creating with initial balance.");
+        transaction.set(_caisseDocRef, {
+          'balance': initialBalance,
+          'last_updated': FieldValue.serverTimestamp(), // Use server timestamp
+          'created_at':
+              FieldValue.serverTimestamp(), // Track initial creation time
+        });
+      }
+    }).catchError((e) {
+      // Handle transaction errors
+      debugPrint("Transaction failed during initializeCaisse: $e");
+      throw Exception("Failed to initialize caisse: $e");
+    });
+  }
+
+  // Update the caisse balance safely using a transaction
+  Future<void> updateCaisseBalance(double amountChange) async {
+    await _db.runTransaction((transaction) async {
+      final snapshot = await transaction.get(_caisseDocRef);
+
+      if (!snapshot.exists || snapshot.data() == null) {
+        // If the caisse document is missing, initialization is required first.
+        // Throw an error to signal this to the calling code (e.g., UI).
+        debugPrint(
+            "Caisse document missing during update attempt. Cannot update.");
+        throw Exception(
+            "Caisse not initialized. Please initialize the caisse first.");
+      }
+
+      // Get the current balance safely
+      final data = snapshot.data()!;
+      final currentBalance = (data['balance'] as num?)?.toDouble() ??
+          0.0; // Default to 0.0 if balance field missing/null
+
+      final newBalance = currentBalance +
+          amountChange; // Add the change (positive for income, negative for expense)
+
+      // Update the balance and the last updated timestamp
+      transaction.update(_caisseDocRef, {
+        'balance': newBalance,
+        'last_updated': FieldValue.serverTimestamp(),
+      });
+    }).catchError((e) {
+      // Handle transaction errors
+      debugPrint("Transaction failed during updateCaisseBalance: $e");
+      throw Exception("Failed to update caisse balance: $e");
+    });
+  }
 
   // --- Resident Methods ---
 
   Future<List<Map<String, dynamic>>> getResidentsWithPaymentInfo() async {
-    // 1. Get all residents
-    final residentsSnapshot = await _db.collection('residents')
-                                      .orderBy('numero') // Assuming 'numero' is still used for ordering
-                                      .get();
+    final residentsSnapshot = await _db
+        .collection('residents')
+        .orderBy('numero') // Assuming 'numero' is the desired order
+        .get();
 
     List<Map<String, dynamic>> residentsData = [];
+    final DateFormat monthKeyFormat =
+        DateFormat('MMMM yyyy', 'fr_FR'); // Consistent key format
 
-    // 2. For each resident, get their payments (This can be inefficient for many residents - see notes below)
     for (var residentDoc in residentsSnapshot.docs) {
       Map<String, dynamic> resident = residentDoc.data();
       resident['id'] = residentDoc.id; // Add the document ID
 
-      final paymentsSnapshot = await _db.collection('payments')
-                                        .where('resident_id', isEqualTo: residentDoc.id)
-                                        .get();
+      // Convert resident's created_at to DateTime for UI/logic consistency
+      if (resident['created_at'] is Timestamp) {
+        resident['created_at_dt'] =
+            (resident['created_at'] as Timestamp).toDate();
+      } else if (resident['created_at'] is DateTime) {
+        // Check if already DateTime
+        resident['created_at_dt'] = resident['created_at'];
+      } else {
+        if (kDebugMode) {
+          print(
+              "Warning: Resident ${residentDoc.id} 'created_at' is not a Timestamp or DateTime. Defaulting.");
+        }
+        resident['created_at_dt'] = DateTime.now(); // Fallback
+      }
 
-      List<Map<String, dynamic>> payments = paymentsSnapshot.docs.map((doc) {
-         final data = doc.data();
-         // Convert Timestamps if necessary for calculation logic
-         if (data['payment_date'] is Timestamp) {
-           data['payment_date_dt'] = (data['payment_date'] as Timestamp).toDate();
-         }
-         // Map other fields if needed for calculation (e.g., amount)
-         data['amount_paid'] = (data['amount'] ?? 0.0).toDouble(); // Assuming 'amount' field holds paid amount
-         // Add month/year if you need them derived from payment_date for calculation
-         if(data['payment_date_dt'] != null){
-            data['month'] = data['payment_date_dt'].month;
-            data['year'] = data['payment_date_dt'].year;
-         }
-         return data;
+      // Fetch payments for the current resident
+      final paymentsSnapshot = await _db
+          .collection('payments')
+          .where('resident_id', isEqualTo: residentDoc.id)
+          .get();
+
+      List<Map<String, dynamic>> paymentsList =
+          paymentsSnapshot.docs.map((doc) {
+        final data = doc.data();
+        data['id'] = doc.id; // Add payment ID
+
+        // Convert payment_date to DateTime and store as payment_date_dt
+        if (data['payment_date'] is Timestamp) {
+          data['payment_date_dt'] =
+              (data['payment_date'] as Timestamp).toDate();
+        } else if (data['payment_date'] is DateTime) {
+          // Check if already DateTime
+          data['payment_date_dt'] = data['payment_date'];
+        } else {
+          if (kDebugMode) {
+            print(
+                "Warning: Payment ${doc.id} 'payment_date' is not a Timestamp. Defaulting.");
+          }
+          data['payment_date_dt'] = DateTime.now(); // Fallback
+        }
+
+        // Ensure other fields are correctly typed/handled if needed later
+        data['amount_paid'] = (data['amount'] ?? 0.0).toDouble();
+        data['months_covered_str'] =
+            data['months_covered']?.toString() ?? ''; // Get the original string
+
+        return data; // Return the processed map
       }).toList();
+      resident['payments'] =
+          paymentsList; // Attach processed payments list to resident
 
-      resident['payments'] = payments; // Add payments list to the resident map
-
-      // --- Calculate montant_restant (Logic adapted from Supabase version) ---
-      // Ensure fields exist and have defaults
+      // --- Calculate montant_restant based on months_covered ---
+      DateTime registrationDate =
+          resident['created_at_dt']; // Already a DateTime
       double monthlyDue = (resident['monthly_due'] ?? 0.0).toDouble();
-      DateTime registrationDate = (resident['created_at'] as Timestamp?)?.toDate() ?? DateTime.now(); // Handle null/missing
-
       DateTime now = DateTime.now();
-      int currentMonth = now.month;
-      int currentYear = now.year;
 
-      // Calculate months since registration (inclusive of the registration month potentially, adjust as needed)
-      // Be careful with edge cases (e.g., registration this month)
-      int monthsDiff = (currentYear - registrationDate.year) * 12 + (currentMonth - registrationDate.month);
-      if (monthsDiff < 0) monthsDiff = 0; // Cannot have negative months
-      // If you want to include the current month fully, add 1, e.g., +1. Check your business logic.
-      // Or maybe calculate based on *next* month due date? Clarify requirement. Let's assume months passed for now.
+      // 1. Get all unique "paid month keys" for this resident (normalized to lowercase)
+      Set<String> paidMonthKeys = {};
+      for (var payment in paymentsList) {
+        // Use the stored 'months_covered_str' which was normalized on save
+        paidMonthKeys
+            .addAll(_parseMonthsCovered(payment['months_covered_str']));
+      }
 
-      double totalDue = monthlyDue * monthsDiff; // Potentially monthsDiff + 1 depending on logic
+      // 2. Calculate total due based on unpaid months from registration up to current month (inclusive)
+      double calculatedMontantRestant = 0;
+      DateTime monthIterator = DateTime(registrationDate.year,
+          registrationDate.month, 1); // Start from the first day of reg month
+      DateTime endIterationMonth = DateTime(now.year, now.month,
+          1); // Iterate up to the first day of the current month
 
-      double totalPaid = payments.fold(0.0, (sum, payment) {
-        // Use the derived DateTime for comparison
-         DateTime? paymentDt = payment['payment_date_dt'];
-         if(paymentDt != null) {
-            // Your original logic checked payment month/year columns. Now check payment_date.
-            // Only sum payments made for periods up to the current month/year.
-            if (paymentDt.year < currentYear ||
-                (paymentDt.year == currentYear && paymentDt.month <= currentMonth)) {
-                 return sum + (payment['amount_paid'] ?? 0.0).toDouble();
-             }
-         }
-         // Alternative: If payment relates to specific months covered:
-         // Parse 'months_covered' and check if it falls within the required range.
-         // This calculation depends heavily on your exact requirements for "due" vs "paid".
+      // Loop through each month from registration month up to the current month
+      while (monthIterator.isBefore(endIterationMonth) ||
+          monthIterator.isAtSameMomentAs(endIterationMonth)) {
+        // Generate the key for the current month in the iteration (normalized to lowercase)
+        String currentMonthKey =
+            monthKeyFormat.format(monthIterator).toLowerCase();
 
-        return sum;
-      });
+        // If this month is *not* found in the set of paid months, add the monthly due to the rest
+        if (!paidMonthKeys.contains(currentMonthKey)) {
+          calculatedMontantRestant += monthlyDue;
+        }
 
-      resident['montant_restant'] = totalDue - totalPaid;
+        // Move to the first day of the next month
+        monthIterator =
+            DateTime(monthIterator.year, monthIterator.month + 1, 1);
+      }
+
+      resident['montant_restant'] = calculatedMontantRestant;
       // --- End Calculation ---
 
-      residentsData.add(resident);
+      residentsData.add(
+          resident); // Add the resident map with calculated data to the list
     }
 
-    // **Performance Note:** Fetching payments for each resident individually (N+1 problem)
-    // can be slow. Alternatives:
-    // 1. Fetch ALL payments once, then filter/group them client-side. Better for moderate data.
-    // 2. Use Firestore Subcollections: Store payments within each resident document (`residents/{residentId}/payments/{paymentId}`). More complex queries (Collection Group Queries) needed to get *all* payments across residents.
-    // 3. Denormalize aggregated data (e.g., store `total_paid` on the resident document, update with Cloud Functions). Most complex but scalable.
-
-    return residentsData;
+    return residentsData; // Return the list of processed resident maps
   }
 
-
-  Future<DocumentReference> addResident({ // Returns DocumentReference which contains the ID
+  Future<DocumentReference> addResident({
     required String numero,
     required String type,
     required double monthlyDue,
-    required String name, // Added name based on payment functions
+    required String name,
   }) async {
-    // Input validation recommended here
-    return _db.collection('residents').add({
-      'numero': numero,
-      'type': type,
-      'monthly_due': monthlyDue,
-      'name': name, // Store the name
-      'created_at': FieldValue.serverTimestamp(), // Use server timestamp
-    });
+    // Input validation recommended here in a real app
+    try {
+      return await _db.collection('residents').add({
+        'numero': numero,
+        'type': type,
+        'monthly_due': monthlyDue,
+        'name': name,
+        'created_at': FieldValue
+            .serverTimestamp(), // Use server timestamp for consistency
+      });
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error in addResident: $e');
+      }
+      rethrow; // Re-throw the exception for the UI to handle
+    }
   }
 
   Future<void> deleteResident(String id) async {
-    // **Caution:** Need to decide if deleting a resident should also delete their payments.
-    // If so, you need a more complex deletion process (e.g., a Cloud Function or batch write).
     try {
-      await _db.collection('residents').doc(id).delete();
-      // Optionally, query and delete associated payments here (or use Cloud Function trigger)
-    } catch (e) {
-      debugPrint('Error deleting resident: $e');
-      rethrow;
-    }
-  }
+      // Use a batch write to delete the resident and all associated payments atomically
+      WriteBatch batch = _db.batch();
 
-  // --- Payment Methods --- (Using the new structure based on Payment class)
+      // Add the resident document deletion to the batch
+      batch.delete(_db.collection('residents').doc(id));
 
-  // Get Payments (similar to your Supabase getPayments)
-  Future<List<Payment>> getPayments() async {
-    try {
-      final snapshot = await _db.collection('payments')
-          .orderBy('payment_date', descending: true)
+      // Find and add all associated payment documents deletions to the batch
+      final paymentsQuery = await _db
+          .collection('payments')
+          .where('resident_id', isEqualTo: id)
           .get();
+      for (var doc in paymentsQuery.docs) {
+        batch.delete(doc.reference);
+      }
 
-      // Already includes resident_name (denormalized)
-      return snapshot.docs.map((doc) => Payment.fromFirestore(doc)).toList();
+      // Commit the batch
+      await batch.commit();
 
+      if (kDebugMode) {
+        print("Successfully deleted resident $id and their payments.");
+      }
     } catch (e) {
-      debugPrint('Error getting payments: $e');
-      throw Exception('Failed to load payments: $e');
+      if (kDebugMode) {
+        print('Error deleting resident and payments: $e');
+      }
+      rethrow; // Re-throw the exception
     }
   }
 
-  // Add Payment (similar to your Supabase addPaymentNew)
+  // Future<List<Payment>> getPayments() async { ... } // Keep if needed elsewhere
+
+  // Add Payment - Now accepts specific paymentDate and includes Caisse update
   Future<Payment> addPaymentNew({
-    required String residentId, // Use Firestore Document ID (String)
+    required String residentId,
     required double amount,
-    required String monthsCovered,
-    // Assuming you fetch resident name beforehand or pass it in
+    required String
+        monthsCovered, // Expects string like "Janvier 2024" or "Janvier 2024, Février 2024"
     required String residentName,
+    required DateTime paymentDate, // Accept the specific date from the dialog
   }) async {
     try {
-      // No need to fetch resident name if passed in or already known.
-      // If you only have residentId, fetch name first (adds latency):
-      // final residentDoc = await _db.collection('residents').doc(residentId).get();
-      // final residentName = residentDoc.data()?['name'] ?? 'Unknown';
-
       final paymentData = {
         'resident_id': residentId,
         'amount': amount,
-        'months_covered': monthsCovered,
-        'payment_date': FieldValue.serverTimestamp(), // Use server timestamp
-        'resident_name': residentName, // Store denormalized name
+        'months_covered': monthsCovered
+            .trim(), // Store trimmed version of the original string
+        'payment_date':
+            Timestamp.fromDate(paymentDate), // Use the date from the dialog
+        'resident_name': residentName,
+        // Add a normalized string for easier searching/filtering/parsing in getResidentsWithPaymentInfo
+        'months_covered_str': monthsCovered
+            .toLowerCase()
+            .split(',')
+            .map((s) => s.trim())
+            .where((s) => s.isNotEmpty)
+            .join(','),
       };
 
+      // Add the payment document to Firestore
       final docRef = await _db.collection('payments').add(paymentData);
 
-      // To return the full Payment object, we need the timestamp assigned by the server.
-      // We either return just the ID or re-fetch the document. Fetching is more accurate.
-      final newDocSnapshot = await docRef.get();
-      return Payment.fromFirestore(newDocSnapshot);
+      // --- Update Caisse Balance (Add payment amount) ---
+      try {
+        // Add the payment amount to the caisse balance using a transaction
+        await updateCaisseBalance(amount);
+        debugPrint("Caisse balance updated by +$amount after payment.");
+      } catch (e) {
+        debugPrint(
+            "Warning: Failed to update caisse balance after adding payment ${docRef.id}: $e");
+        // Decide how to handle this: log, maybe alert user that Caisse is out of sync?
+        // The payment *was* added successfully, only the caisse update failed.
+        // For now, we just log the warning and continue.
+      }
+      // --- End Update Caisse Balance ---
 
+      // Re-fetch the document to get the final state including the server timestamp if used
+      // (though we used the dialog's date for 'payment_date', serverTimestamp might be used elsewhere or just good practice)
+      final newDocSnapshot = await docRef.get();
+      return Payment.fromFirestore(
+          newDocSnapshot); // Return the created Payment object
     } catch (e) {
-      debugPrint('Error adding payment: $e');
-      throw Exception('Failed to add payment: $e');
+      if (kDebugMode) {
+        print('Error adding payment: $e');
+      }
+      throw Exception('Failed to add payment: ${e.toString()}'); // Re-throw
     }
   }
 
   // --- Expense Methods ---
 
   Future<List<Map<String, dynamic>>> getExpenses() async {
-    final snapshot = await _db.collection('expenses')
-        .orderBy('created_at', descending: true)
+    final snapshot = await _db
+        .collection('expenses')
+        .orderBy('created_at', descending: true) // Order by creation date
         .get();
 
     return snapshot.docs.map((doc) {
-       final data = doc.data();
-       data['id'] = doc.id; // Include document ID
-       // Convert Timestamp to DateTime if needed for display
-       if (data['created_at'] is Timestamp) {
-           data['created_at_dt'] = (data['created_at'] as Timestamp).toDate();
-       }
-       return data;
+      final data = doc.data();
+      data['id'] = doc.id; // Include document ID
+
+      // Convert created_at to DateTime
+      if (data['created_at'] is Timestamp) {
+        data['created_at_dt'] = (data['created_at'] as Timestamp).toDate();
+      } else if (data['created_at'] is DateTime) {
+        data['created_at_dt'] = data['created_at'];
+      } else {
+        if (kDebugMode) {
+          print(
+              "Warning: Expense ${doc.id} 'created_at' is not a Timestamp. Defaulting.");
+        }
+        data['created_at_dt'] = DateTime.now(); // Fallback
+      }
+
+      return data; // Return the processed map
     }).toList();
   }
 
@@ -243,24 +411,50 @@ class FirebaseService {
     required String description,
   }) async {
     try {
-      return await _db.collection('expenses').add({
+      // Add the expense document to Firestore
+      final docRef = await _db.collection('expenses').add({
         'name': name,
         'amount': amount,
         'description': description,
-        'created_at': FieldValue.serverTimestamp(),
+        'created_at': FieldValue.serverTimestamp(), // Use server timestamp
       });
+
+      // --- Update Caisse Balance (Subtract expense amount) ---
+      try {
+        // Subtract the expense amount from the caisse balance using a transaction
+        // Pass a negative amount to updateCaisseBalance
+        await updateCaisseBalance(-amount);
+        debugPrint("Caisse balance updated by -$amount after expense.");
+      } catch (e) {
+        debugPrint(
+            "Warning: Failed to update caisse balance after adding expense ${docRef.id}: $e");
+        // Handle error as appropriate (logging, user alert)
+      }
+      // --- End Update Caisse Balance ---
+
+      return docRef; // Return the document reference
     } catch (e) {
-      debugPrint('Error in addExpense: $e');
-      rethrow;
+      if (kDebugMode) {
+        print('Error in addExpense: $e');
+      }
+      rethrow; // Re-throw
     }
   }
 
-  Future<void> deleteExpense(String id) async { // Use String for Firestore ID
+  Future<void> deleteExpense(String id) async {
+    // Use String for Firestore ID
     try {
+      // Optional: If deleting an expense, should the amount be added back to the caisse?
+      // This makes delete logic more complex. For now, delete does NOT affect caisse.
       await _db.collection('expenses').doc(id).delete();
+      if (kDebugMode) {
+        print("Successfully deleted expense $id.");
+      }
     } catch (e) {
-      debugPrint('Error deleting expense: $e');
-      rethrow;
+      if (kDebugMode) {
+        print('Error deleting expense: $e');
+      }
+      rethrow; // Re-throw
     }
   }
 }

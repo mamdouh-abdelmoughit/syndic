@@ -12,6 +12,7 @@ class _AddResidentDialogState extends State<AddResidentDialog> {
   final _formKey = GlobalKey<FormState>();
   final _numeroController = TextEditingController();
   final _monthlyDueController = TextEditingController();
+  final _nameController = TextEditingController(); 
   String _type = 'Appart';
 
   @override
@@ -38,6 +39,17 @@ class _AddResidentDialogState extends State<AddResidentDialog> {
               validator: (value) {
                 if (value == null || value.isEmpty) {
                   return 'Veuillez entrer un numéro';
+                }
+                return null;
+              },
+            ),
+            const SizedBox(height: 16), // Add some spacing
+            TextFormField( // <<< ADD THIS TEXTFORMFIELD FOR NAME
+              controller: _nameController,
+              decoration: const InputDecoration(labelText: 'Nom du Résident'),
+              validator: (value) {
+                if (value == null || value.isEmpty) {
+                  return 'Veuillez entrer un nom';
                 }
                 return null;
               },
@@ -88,6 +100,7 @@ class _AddResidentDialogState extends State<AddResidentDialog> {
             if (_formKey.currentState!.validate()) {
               Navigator.pop(context, {
                 'numero': _numeroController.text,
+                'name': _nameController.text,
                 'type': _type,
                 'monthlyDue': double.parse(_monthlyDueController.text),
               });

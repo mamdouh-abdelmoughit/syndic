@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:syndic_app/pages/Depense_page.dart';
+import 'package:syndic_app/pages/caisse_page.dart';
 import 'resident_page.dart';
 
 class FirstPage extends StatelessWidget {
@@ -49,16 +50,26 @@ class FirstPage extends StatelessWidget {
               child: const Text('Depense', style: TextStyle(fontSize: 18)),
             ),
             const SizedBox(height: 20),
- /*           ElevatedButton(
+ // --- ADD NEW CAISSE BUTTON ---
+            ElevatedButton(
               onPressed: () {
-                // TODO: Navigate to Divers page
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => const CaissePage(), // Navigate to CaissePage
+                  ),
+                );
               },
               style: ElevatedButton.styleFrom(
                 padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 15),
                 minimumSize: const Size(200, 50),
+                 textStyle: const TextStyle(fontSize: 18),
+                 backgroundColor: Theme.of(context).colorScheme.secondary, // Optional: distinguish button color
+                 foregroundColor: Theme.of(context).colorScheme.onSecondary,
               ),
-              child: const Text('Divers', style: TextStyle(fontSize: 18)),
-            ),*/
+              child: const Text('Caisse'),
+            ),
+             // --- END ADD NEW CAISSE BUTTON ---
           ],
         ),
       ),
